@@ -18,8 +18,9 @@ class DigiTwinBase(ABC):
     def parse(self):
         pass
 
-    def itertimes(self, raw_data: tuple):
-        data = self.prepare_data(raw_data)
+    @abstractmethod
+    def itertimes(self, data: tuple):
+        raise NotImplemented
 
     @abstractmethod
     def prepare_data(self, data: tuple):

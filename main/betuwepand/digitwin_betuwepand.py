@@ -1,15 +1,47 @@
-import os
 import pandas as pd
 from digitwin.digitwin import DigiTwinBase
-from geolib.models.dstability import DStabilityModel
-from pathlib import Path
-import dateutil.parser
-from typing import List, Any
-from create_scenarios import *
 import subprocess
+from data_processing import *
+from create_scenarios import *
+from dike_stability_analysis import *
+from typing import Any
 
 
 class DigiTwinBetuwepand(DigiTwinBase):
+
+    def itertimes(self, data: tuple, **kwargs) -> dict:
+
+        if "return_period" in list(kwargs.keys()):
+            return_period = kwargs["return_period"]
+        else:
+            raise Exception("Return periods not provided")
+
+        if "eva_times" in list(kwargs.keys()):
+            eva_times = kwargs["eva_times"]
+        else:
+            raise Exception("EVA times not provided")
+
+        scenario_types = ["simulated", "return period", "extreme value"]
+        # scenarios = self.set_scenarios(data, scenario_types, return_period=return_period, eva_times=eva_times)
+
+        scenarios = {}
+        daily_scenarios = {}
+        calculation_days = list(data["weather"].index)
+        calculation_days = calculation_days[:5]
+        for calculation_day in calculation_days:
+            scenario = self.set_scenarios(data, scenario_types=["daily"], calculation_day=calculation_day)
+            daily_scenarios[calculation_day] = scenario
+
+        scenarios.update(daily_scenarios)
+
+        scenarios = self.performance(
+            scenarios,
+            stability_console=kwargs["stability_console"],
+            file_path=kwargs["file_path"]
+        )
+
+        return scenarios
+
 
     def set_scenarios(self, data: dict, **kwargs) -> dict:
 
@@ -23,10 +55,13 @@ class DigiTwinBetuwepand(DigiTwinBase):
 
         scenario_found = False
         if "daily" in scenario_types:
-            time_max_measured = data["weather"][sensor_ids[-1]].idxmax()
+            if "calculation_day" in list(kwargs.keys()):
+                calculation_day = kwargs["calculation_day"]
+            else:
+                calculation_day = data["weather"][sensor_ids[-1]].idxmax()
             scenario = create_scenario_raai(
-                scenario_name="Measurements "+time_max_measured.strftime('%Y-%m-%d %X'),
-                time=time_max_measured,
+                scenario_name="Measurements "+calculation_day.strftime('%Y-%m-%d %X'),
+                time=calculation_day,
                 sensor_ids=data["sensor_ids"],
                 input_df=data["weather"],
                 sensor_df=data["sensors"],
@@ -98,7 +133,14 @@ class DigiTwinBetuwepand(DigiTwinBase):
     def predict(self):
         pass
 
-    def performance(self, geo_model: Any, scenarios: dict) -> dict:
+    def performance(self, scenario: dict, **kwargs) -> dict:
+
+        stability_console = kwargs["stability_console"]
+        file_path = kwargs["file_path"]
+
+        geo_model = DStabilityModel()
+        geo_model.parse(Path(file_path))
+        surface_line = get_surface_line(geo_model)
 
         for i_scenario, (scenario_name, scenario) in enumerate(scenarios.items()):
 
@@ -107,24 +149,23 @@ class DigiTwinBetuwepand(DigiTwinBase):
             geo_model = adapt_waternet(geo_model, PL, HL)
 
             # Calculate FoS and collect slip plane details.
-            StabilityConsole = r"C:\Program Files (x86)\Deltares\D-GEO Suite\D-Stability 2024.01\bin\D-Stability Console.exe"
-            dm.serialize(Path(r'.\work_folder\test.stix'))
-            FileName = r".\work_folder\test.stix"
-            cmd = ('"' + StabilityConsole + '" "' + FileName + '"')
+            geo_model.serialize(Path(file_path))
+            cmd = ('"' + stability_console + '" "' + file_path + '"')
             subprocess.call(cmd, shell=True)
-            dm_copy = DStabilityModel()
-            dm_copy.parse(Path('./work_folder/test.stix'))
-            FoS = dm_copy.get_result().FactorOfSafety
-            slip_plane = draw_lift_van_slip_plane(x_center_left=dm_copy.get_result().get_slipcircle_output().x_left,
-                                                  z_center_left=dm_copy.get_result().get_slipcircle_output().z_left,
-                                                  x_center_right=dm_copy.get_result().get_slipcircle_output().x_right,
-                                                  z_center_right=dm_copy.get_result().get_slipcircle_output().z_right,
-                                                  tangent_line=dm_copy.get_result().get_slipcircle_output().z_tangent,
+
+            geo_model_copy = DStabilityModel()
+            geo_model_copy.parse(Path('./work_folder/test.stix'))
+            fos = geo_model_copy.get_result().FactorOfSafety
+            slip_plane = draw_lift_van_slip_plane(x_center_left=geo_model_copy.get_result().get_slipcircle_output().x_left,
+                                                  z_center_left=geo_model_copy.get_result().get_slipcircle_output().z_left,
+                                                  x_center_right=geo_model_copy.get_result().get_slipcircle_output().x_right,
+                                                  z_center_right=geo_model_copy.get_result().get_slipcircle_output().z_right,
+                                                  tangent_line=geo_model_copy.get_result().get_slipcircle_output().z_tangent,
                                                   surface_line={'s': surface_line[:, 0], 'z': surface_line[:, 1]})
 
             #TODO: PTK calculation
 
-            scenario['FoS'] = FoS
+            scenario['FoS'] = fos
             scenario['Slip plane'] = slip_plane
             scenarios[scenario_name] = scenario
 
@@ -137,11 +178,11 @@ class DigiTwinBetuwepand(DigiTwinBase):
         pass
     
     def prepare_data(self, data: dict) -> dict:
-        raai_df = self.sensor_data(data["sensors"])
-        weather_df = self.weather_data(data["sensor_folder"], data["weather"])
-        idf_head_res = self.extremes_data(data["extremes"])
-        peil_df = self.piezometer_data(data["piezometer"])
-        return_t_df_eva = self.return_data(data["returns"])
+        raai_df = sensor_data(data["sensors"])
+        weather_df = weather_data(data["sensor_folder"], data["weather"])
+        idf_head_res = extremes_data(data["extremes"])
+        peil_df = piezometer_data(data["piezometer"])
+        return_t_df_eva = return_data(data["returns"])
         data = {
             "sensors": raai_df,
             "weather": weather_df,
@@ -150,79 +191,6 @@ class DigiTwinBetuwepand(DigiTwinBase):
             "piezometer": peil_df,
         }
         return data
-
-    def sensor_data(self, sensor_path: str) -> pd.DataFrame:
-        raai_df = pd.read_excel(sensor_path, sheet_name="Sensoren")
-        return raai_df
-
-    def combine_data(self, sensor_files: List[str], weather_file: pd.DataFrame) -> pd.DataFrame:
-        datetime_format = '%Y-%m-%d %H:%M'
-
-        df_weather = pd.read_pickle(weather_file)
-        df_weather = df_weather.rename(columns={'RH': 'neerslag', 'EV24': 'verdamping'})
-        df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], errors='coerce', utc=True)
-        df_weather.index = df_weather['datetime']
-        df_weather = df_weather[['neerslag', 'verdamping']]
-        df_weather = df_weather[~pd.isna(df_weather['neerslag'])]
-        df_weather['neerslag'] /= 10  # In KNMI, rainfall data is in 0.1mm units
-        df_weather = df_weather.tz_localize(None)
-
-        dfs_sensor = []
-        for i, sensor_file in enumerate(sensor_files):
-            sensor_name = sensor_file.split('.')[-2].split('\\')[-1]
-            df_sensor = pd.read_csv(sensor_file, delimiter=';')
-            df_sensor['MessageTimestamp'] = pd.to_datetime(df_sensor['MessageTimestamp'], errors='coerce', utc=True)
-            df_sensor['MessageTimestamp'] = df_sensor['MessageTimestamp'].dt.floor('h')
-            df_sensor.index = df_sensor['MessageTimestamp']
-            df_sensor = df_sensor['WaterLevel'].to_frame()
-            df_sensor = df_sensor.rename(columns={'WaterLevel': sensor_name})
-            df_sensor = df_sensor.sort_index()
-            df_sensor = df_sensor.groupby(df_sensor.index).mean()
-            dfs_sensor.append(df_sensor)
-        df_sensor = pd.concat(dfs_sensor, axis=1)
-        df_sensor = df_sensor.tz_localize(None)
-
-        df = pd.concat((df_weather, df_sensor), axis=1)
-        df = df.dropna(how='all')
-        df.index = pd.to_datetime(df.index, format=datetime_format)
-
-        return df
-
-    def weather_data(self, sensor_folder:str, weather_path: str) -> pd.DataFrame:
-        sensor_files = [sensor_folder + '\\' + sensor_file for sensor_file in os.listdir(sensor_folder)]
-        input_data = self.combine_data(sensor_files, weather_path)
-        return input_data
-
-    def extremes_data(self, extremes_path: str) -> pd.DataFrame:
-        idf_head_res = pd.read_pickle(extremes_path)  # TODO: Adjust this for ARK
-        idf_head_res = idf_head_res.iloc[:5]
-        idf_head_res['Scenario'] = [  # TODO: Remove renaming of scenarios when the sensor data file becomes available
-            'PB-01 tm 2023-06',
-            'Raai_6B_Noord_Binnenkruin_(RFT_R52_0042_05m_BiKr)-20220901-20230417',
-            'Raai_6B_Noord_Binnenteen_(RFT_R52_0042_05m_BiT)-20220901-20230417',
-            'Raai_6B_Noord_Buitenkruin_(RFT_R52_0042_05m_BuKr)-20220901-20230417',
-            'Raai_6B_Noord_Insteek_berm_(RFT_R52_0042_05m_InstBrm)-20220901-20230417'
-        ]
-        return idf_head_res
-
-    def piezometer_data(self, piezometer_path: str) -> pd.DataFrame:
-        peil_df = pd.read_csv(output_folder.joinpath(piezometer_path), index_col=0, header=[0, 1], parse_dates=True)
-        peil_df = peil_df[peil_df.index >= dateutil.parser.parse("2021-05-01")]
-        return peil_df
-
-    def return_data(self, returns_path: str) -> pd.DataFrame:
-        return_t_df_eva = pd.read_csv(returns_path)
-        return_t_df_eva['peilbuis'].replace({
-            'HB-6B-1_PB1': 'Raai_6B_Noord_Binnenkruin_(RFT_R52_0042_05m_BiKr)-20220901-20230417',
-            'HB-6B-2_PB1': 'Raai_6B_Noord_Binnenteen_(RFT_R52_0042_05m_BiT)-20220901-20230417',
-            'HB-6B-3_PB1': 'Raai_6B_Noord_Buitenkruin_(RFT_R52_0042_05m_BuKr)-20220901-20230417',
-            'HB-6B-4_PB1': 'Raai_6B_Noord_Insteek_berm_(RFT_R52_0042_05m_InstBrm)-20220901-20230417',
-            'PB007718': 'PB-01 tm 2023-06'
-        }, inplace=True)
-        return_t_df_eva.index = pd.MultiIndex.from_frame(return_t_df_eva[['peilbuis', 'simname', 'T']])
-        return_t_df_eva = return_t_df_eva['return value']
-        return return_t_df_eva
-
 
 
 if __name__ =="__main__":
@@ -233,7 +201,7 @@ if __name__ =="__main__":
         "weather": r'data/processed/weather_knmi.pickle',
         "extremes": r"./work_folder/idf_extremes.pkl",
         "returns": r'data/processed/extremes.csv',
-        "piezometer": r'test_peil_pred.csv',
+        "piezometer": r'./work_folder/test_peil_pred.csv',
     }
 
     output_folder = Path(r"./work_folder")
@@ -259,16 +227,14 @@ if __name__ =="__main__":
 
     return_period = 1_000
     eva_times = [10, 100, 1000]
-    scenarios = dt.set_scenarios(
+    stability_console = r"C:\Program Files (x86)\Deltares\D-GEO Suite\D-Stability 2024.01\bin\D-Stability Console.exe"
+    file_path = r"work_folder/test.stix"
+
+    results = dt.itertimes(
         data,
-        scenario_types=["daily", "return period"],
-        return_period=1_000,
-        eva_times=eva_times
+        eva_times=eva_times,
+        return_period=return_period,
+        stability_console=stability_console,
+        file_path=file_path
     )
-
-    results = dt.performance(scenarios)
-
-    # dm = DStabilityModel()
-    # dm.parse(Path(r"./data/processed/template.stix"))
-    # surface_line = get_surface_line(dm)
 
